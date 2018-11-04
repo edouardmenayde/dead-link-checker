@@ -1,0 +1,10 @@
+[package]
+name = "dead-link-checker"
+version = "0.1.0"
+authors = ["Edouard Menayde <edouard.menayde@gmail.com>"]
+
+[dependencies]
+hyper = "0.12"
+hyper-tls = "0.3"
+tokio = "0.1"
+futures = "0.1"
