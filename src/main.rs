@@ -3,6 +3,7 @@ extern crate hyper;
 extern crate tokio;
 extern crate futures;
 extern crate hyper_tls;
+extern crate regex;
 
 use std::rc::Rc;
 use std::cell::RefCell;
@@ -28,23 +29,31 @@ use tokio::prelude::IntoFuture;
 use futures::Stream;
 use tokio::io;
 use hyper::client::ResponseFuture;
+use std::sync::mpsc;
+use regex::Regex;
+use std::fs::read_to_string;
 
-fn process_url(url: Uri, processing_units: Arc<AtomicUsize>, is_empty: Arc<Condvar>, client: Client<HttpsConnector<HttpConnector>>) -> impl Future<Item=(), Error=()> {
-    println!("Processed {}", url);
+fn process_url(url: Uri, processing_units: Arc<AtomicUsize>, client: Client<HttpsConnector<HttpConnector>>, tx: mpsc::Sender<Vec<Uri>>) -> impl Future<Item=(), Error=()> {
     client
         .get(url)
         .then(move |res|{
             let res = res.unwrap();
             if res.status() == StatusCode::MOVED_PERMANENTLY {
-                println!("{}", res.headers().get("Location").unwrap().to_str().unwrap());
+                let redirection =  res.headers().get("Location").unwrap().to_str().unwrap();
+                tx.send(vec![redirection.parse::<Uri>().unwrap()]);
+
             } else {
                 println!("{}", res.status());
+                let re = Regex::new(r#"(href|src)=["']([\w/.:\-\d,?=]+)["']"#).unwrap();
+                let body = String::from(res.into_body()).to_str();
+
+                for cap in re.captures_iter(body) {
+                    println!("{}", cap);
+                }
+                tx.send(vec![]);
             }
 
-            println!("\n\nFinished checking website.");
             processing_units.fetch_sub(1, Ordering::SeqCst);
-            is_empty.notify_one();
-
             future::ok(())
         })
 }
@@ -59,14 +68,6 @@ fn main() {
     };
 
     let url = url.parse::<Uri>().unwrap();
-
-    let links: Rc<RefCell<Vec<Uri>>> = Rc::new(RefCell::new(Vec::new()));
-
-    links.borrow_mut().push(url.clone());
-
-    let mutex = Arc::new(Mutex::new(false));
-    let is_empty = Arc::new(Condvar::new());
-    let has_finished_checking = Arc::new(AtomicBool::new(false));
     let processing_units = Arc::new(AtomicUsize::new(0));
 
     let mut rt = Runtime::new().unwrap();
@@ -75,45 +76,31 @@ fn main() {
     let client = Client::builder()
         .build::<_, hyper::Body>(https);
 
-    loop {
-        println!("Looping");
-        let link;
+    let (tx, rx) = mpsc::channel();
 
-        {
-            let mutex_guard = mutex.lock().unwrap();
+    {
+        processing_units.fetch_add(1, Ordering::SeqCst);
+        let processing_units = Arc::clone(&processing_units);
+        let client = client.clone();
+        let tx = mpsc::Sender::clone(&tx);
+        rt.spawn(future::lazy(|| process_url(url, processing_units, client, tx)));
+    }
 
-            if processing_units.load(Ordering::SeqCst) == 0 && links.borrow().is_empty() {
-                has_finished_checking.store(true, Ordering::SeqCst);
+    for received in rx {
+        for link in received {
+            {
+                let tx = mpsc::Sender::clone(&tx);
+                processing_units.fetch_add(1, Ordering::SeqCst);
+                let processing_units = Arc::clone(&processing_units);
+                let client = client.clone();
+                rt.spawn(future::lazy(|| process_url(link, processing_units, client, tx)));
             }
-
-            if has_finished_checking.load(Ordering::SeqCst) {
-                println!("Finished");
-                break;
-            }
-
-            if links.borrow().is_empty() {
-                println!("Empty");
-                is_empty.wait(mutex_guard).unwrap();
-            }
-
-            if processing_units.load(Ordering::SeqCst) == 0 && links.borrow().is_empty() {
-                has_finished_checking.store(true, Ordering::SeqCst);
-            }
-
-            if has_finished_checking.load(Ordering::SeqCst) == true {
-                println!("Finished");
-                break;
-            }
-
-            link = links.borrow_mut().pop().unwrap();
         }
 
-        {
-            processing_units.fetch_add(1, Ordering::SeqCst);
-            let processing_units = Arc::clone(&processing_units);
-            let is_empty = Arc::clone(&is_empty);
-            let client = client.clone();
-            rt.spawn(future::lazy(|| process_url(link, processing_units, is_empty, client)));
+        if processing_units.load(Ordering::SeqCst) == 0 {
+            break;
         }
     }
+
+    println!("Finished checking website.");
 }
