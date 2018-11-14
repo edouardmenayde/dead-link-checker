@@ -4,6 +4,7 @@ extern crate tokio;
 extern crate futures;
 extern crate hyper_tls;
 extern crate regex;
+extern crate reqwest;
 
 use std::rc::Rc;
 use std::cell::RefCell;
@@ -15,46 +16,60 @@ use std::thread;
 
 use core::time;
 
-use hyper::Uri;
 use tokio::runtime::Runtime;
 use tokio::prelude::future::FutureResult;
 use futures::{future, Future};
-use hyper::{Client, StatusCode, Response};
-use hyper_tls::HttpsConnector;
-use hyper::client::HttpConnector;
+use hyper::StatusCode;
 use hyper::rt::{self};
 use std::result::Result::Ok;
 use futures::Poll;
 use tokio::prelude::IntoFuture;
 use futures::Stream;
-use tokio::io;
-use hyper::client::ResponseFuture;
 use std::sync::mpsc;
 use regex::Regex;
 use std::fs::read_to_string;
+use reqwest::async::{Client, Decoder};
+use std::mem;
+use std::io::Cursor;
+use std::io;
+use std::str;
 
-fn process_url(url: Uri, processing_units: Arc<AtomicUsize>, client: Client<HttpsConnector<HttpConnector>>, tx: mpsc::Sender<Vec<Uri>>) -> impl Future<Item=(), Error=()> {
+fn process_url(url: String, processing_units: Arc<AtomicUsize>, client: Client, tx: mpsc::Sender<Vec<String>>) -> impl Future<Item=(), Error=()> {
     client
-        .get(url)
-        .then(move |res|{
-            let res = res.unwrap();
-            if res.status() == StatusCode::MOVED_PERMANENTLY {
-                let redirection =  res.headers().get("Location").unwrap().to_str().unwrap();
-                tx.send(vec![redirection.parse::<Uri>().unwrap()]);
+        .get(&url)
+        .send()
+        .then(move |res| {
+            let mut res = res.unwrap();
+            let body = mem::replace(res.body_mut(), Decoder::empty());
+            body.concat2()
+                .map(move |body| {
+                    let mut body = Cursor::new(body);
+                    let mut writer: Vec<u8> = vec![];
+                    let _ = io::copy(&mut body, &mut writer).map_err(|err| {
+                        println!("stdout error: {}", err);
+                    });
 
-            } else {
-                println!("{}", res.status());
-                let re = Regex::new(r#"(href|src)=["']([\w/.:\-\d,?=]+)["']"#).unwrap();
-                let body = String::from(res.into_body()).to_str();
+                    let body = str::from_utf8(&writer).unwrap();
 
-                for cap in re.captures_iter(body) {
-                    println!("{}", cap);
-                }
-                tx.send(vec![]);
-            }
+                    let mut links;
 
-            processing_units.fetch_sub(1, Ordering::SeqCst);
-            future::ok(())
+                    if res.status() == StatusCode::MOVED_PERMANENTLY {
+                        let redirection = res.headers().get("Location").unwrap().to_str().unwrap();
+                        links = vec![redirection.to_string()];
+                    } else {
+                        let re = Regex::new(r#"(href|src)=["']([\w/.:\-\d,?=]+)["']"#).unwrap();
+
+                        links = vec![];
+                        for caps in re.captures_iter(body) {
+                            links.push(caps[2].to_string());
+                        }
+                    }
+                    processing_units.fetch_sub(1, Ordering::SeqCst); // Must be before the tx send
+                    tx.send(links);
+                })
+                .then(|_| {
+                    future::ok(())
+                })
         })
 }
 
@@ -67,14 +82,11 @@ fn main() {
         }
     };
 
-    let url = url.parse::<Uri>().unwrap();
     let processing_units = Arc::new(AtomicUsize::new(0));
 
     let mut rt = Runtime::new().unwrap();
 
-    let https = HttpsConnector::new(4).unwrap();
-    let client = Client::builder()
-        .build::<_, hyper::Body>(https);
+    let client = Client::new();
 
     let (tx, rx) = mpsc::channel();
 
@@ -83,16 +95,22 @@ fn main() {
         let processing_units = Arc::clone(&processing_units);
         let client = client.clone();
         let tx = mpsc::Sender::clone(&tx);
+        let url = url.clone();
         rt.spawn(future::lazy(|| process_url(url, processing_units, client, tx)));
     }
 
     for received in rx {
-        for link in received {
+        println!("Received links !");
+        for mut link in received {
             {
+                println!("{}", link);
                 let tx = mpsc::Sender::clone(&tx);
                 processing_units.fetch_add(1, Ordering::SeqCst);
                 let processing_units = Arc::clone(&processing_units);
                 let client = client.clone();
+                if link.get(0..1).unwrap() == "/" {
+                    link = format!("{}{}", url, link);
+                }
                 rt.spawn(future::lazy(|| process_url(link, processing_units, client, tx)));
             }
         }
