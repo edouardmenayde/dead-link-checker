@@ -4,37 +4,37 @@ extern crate tokio;
 extern crate futures;
 extern crate hyper_tls;
 extern crate regex;
+extern crate url;
 extern crate reqwest;
 
-use std::rc::Rc;
-use std::cell::RefCell;
-use std::env;
-use std::sync::{Arc, Mutex, Condvar};
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::thread;
-
-use core::time;
+use std::io::Cursor;
+use std::sync::mpsc;
+use std::{mem, io, str, env};
 
 use tokio::runtime::Runtime;
-use tokio::prelude::future::FutureResult;
 use futures::{future, Future};
 use hyper::StatusCode;
-use hyper::rt::{self};
-use std::result::Result::Ok;
-use futures::Poll;
-use tokio::prelude::IntoFuture;
 use futures::Stream;
-use std::sync::mpsc;
 use regex::Regex;
-use std::fs::read_to_string;
 use reqwest::async::{Client, Decoder};
-use std::mem;
-use std::io::Cursor;
-use std::io;
-use std::str;
 
-fn process_url(url: String, processing_units: Arc<AtomicUsize>, client: Client, tx: mpsc::Sender<Vec<String>>) -> impl Future<Item=(), Error=()> {
+#[derive(Debug)]
+enum ResponseStatus {
+    Ok,
+    Err(StatusCode),
+}
+
+#[derive(Debug)]
+struct Response {
+    processed_link : String,
+    status: ResponseStatus,
+    extracted_links: Option<Vec<String>>,
+}
+
+fn process_url(url: String, processing_units: Arc<AtomicUsize>, client: Client, tx: mpsc::Sender<Response>) -> impl Future<Item=(), Error=()> {
     client
         .get(&url)
         .send()
@@ -49,28 +49,92 @@ fn process_url(url: String, processing_units: Arc<AtomicUsize>, client: Client, 
                         println!("stdout error: {}", err);
                     });
 
-                    let body = str::from_utf8(&writer).unwrap();
+                    let body = str::from_utf8(&writer);
 
-                    let mut links;
+                    if let Some(body) = body.ok() {
+                        let mut links;
 
-                    if res.status() == StatusCode::MOVED_PERMANENTLY {
-                        let redirection = res.headers().get("Location").unwrap().to_str().unwrap();
-                        links = vec![redirection.to_string()];
-                    } else {
-                        let re = Regex::new(r#"(href|src)=["']([\w/.:\-\d,?=]+)["']"#).unwrap();
+                        if res.status() == StatusCode::MOVED_PERMANENTLY {
+                            let redirection = res.headers().get("Location").unwrap().to_str().unwrap();
+                            links = vec![redirection.to_string()];
+                        } else {
+                            let re = Regex::new(r#"(href|src)=["']([\w/.:\-\d,?=]+)["']"#).unwrap();
 
-                        links = vec![];
-                        for caps in re.captures_iter(body) {
-                            links.push(caps[2].to_string());
+                            links = vec![];
+                            for caps in re.captures_iter(body) {
+                                links.push(caps[2].to_string());
+                            }
                         }
+                        processing_units.fetch_sub(1, Ordering::SeqCst); // Must be before the tx send
+                        tx.send(Response {
+                            processed_link: url,
+                            extracted_links: Some(links),
+                            status: ResponseStatus::Ok,
+                        });
+                    } else {
+                        processing_units.fetch_sub(1, Ordering::SeqCst);
+                        tx.send(Response {
+                            processed_link: url,
+                            status: ResponseStatus::Err(res.status()),
+                            extracted_links: None,
+                        });
                     }
-                    processing_units.fetch_sub(1, Ordering::SeqCst); // Must be before the tx send
-                    tx.send(links);
                 })
                 .then(|_| {
                     future::ok(())
                 })
         })
+}
+
+#[derive(Debug)]
+enum Error {
+    ParseError,
+    CrossOrigin,
+}
+
+impl From<url::ParseError> for Error {
+    fn from(_e: url::ParseError) -> Error {
+        Error::ParseError
+    }
+}
+
+fn sanitize_link(scheme: &str, host: &str, link: &String) -> Result<String, Error> {
+    if link.len() == 0 {
+        return Err(Error::ParseError);
+    }
+
+    let is_relative = link.get(0..1).unwrap_or(" ") == "/";
+
+    if is_relative {
+        return Ok(format!("{}://{}{}", scheme, host, link));
+    }
+
+    let parsed_url = url::Url::parse(link.as_str())?;
+    let link_host = parsed_url.host_str();
+
+    if let Some(l_host) = link_host {
+        if l_host != host {
+            return Err(Error::CrossOrigin);
+        }
+
+
+        return Ok(link.to_string());
+    }
+
+    return Err(Error::ParseError);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_link_test() {
+        let scheme = "https";
+        let host = "example.com";
+        let link = String::from("/test.html");
+        assert_eq!(sanitize_link(scheme, host, &link).unwrap(), String::from(format!("{}://{}{}", scheme, host, link)))
+    }
 }
 
 fn main() {
@@ -81,6 +145,11 @@ fn main() {
             return;
         }
     };
+
+    let link = url::Url::parse(url.as_str()).unwrap();
+
+    let host = link.host_str().unwrap();
+    let scheme = link.scheme();
 
     let processing_units = Arc::new(AtomicUsize::new(0));
 
@@ -99,19 +168,24 @@ fn main() {
         rt.spawn(future::lazy(|| process_url(url, processing_units, client, tx)));
     }
 
-    for received in rx {
-        println!("Received links !");
-        for mut link in received {
-            {
-                println!("{}", link);
-                let tx = mpsc::Sender::clone(&tx);
-                processing_units.fetch_add(1, Ordering::SeqCst);
-                let processing_units = Arc::clone(&processing_units);
-                let client = client.clone();
-                if link.get(0..1).unwrap() == "/" {
-                    link = format!("{}{}", url, link);
+    for response in rx {
+        if let Some(links) = response.extracted_links {
+            for mut link in links {
+                {
+                    println!("{}", link);
+                    match sanitize_link(scheme, host, &link) {
+                        Ok(sanitized_link) => {
+                            let tx = mpsc::Sender::clone(&tx);
+                            processing_units.fetch_add(1, Ordering::SeqCst);
+                            let processing_units = Arc::clone(&processing_units);
+                            let client = client.clone();
+                            rt.spawn(future::lazy(|| process_url(sanitized_link, processing_units, client, tx)));
+                        }
+                        Err(error) => {
+                            println!("{:?}", error);
+                        }
+                    }
                 }
-                rt.spawn(future::lazy(|| process_url(link, processing_units, client, tx)));
             }
         }
 
