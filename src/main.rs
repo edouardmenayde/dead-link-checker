@@ -28,7 +28,7 @@ enum ResponseStatus {
   Ok,
   Unreachable,
   Err(StatusCode),
-  Processing
+  Processing,
 }
 
 #[derive(Clone, Debug)]
@@ -45,50 +45,64 @@ fn process_url(url: String, processing_units: Arc<AtomicUsize>, client: Client, 
       .then(move |res| {
         match res {
           Ok(mut res) => {
-            let body = mem::replace(res.body_mut(), Decoder::empty());
-            body.concat2()
-                .map(move |body| {
-                  let mut body = Cursor::new(body);
-                  let mut writer: Vec<u8> = vec![];
-                  let _ = io::copy(&mut body, &mut writer).map_err(|err| {
-                    println!("stdout error: {}", err);
-                  });
+            if res.status().is_success() {
+              let body = mem::replace(res.body_mut(), Decoder::empty());
+              body.concat2()
+                  .map(move |body| {
+                    let mut body = Cursor::new(body);
+                    let mut writer: Vec<u8> = vec![];
+                    let _ = io::copy(&mut body, &mut writer).map_err(|err| {
+                      println!("stdout error: {}", err);
+                    });
 
-                  let body = str::from_utf8(&writer);
+                    let body = str::from_utf8(&writer);
 
-                  // @TODO: handle images or pdf...
-                  if let Some(body) = body.ok() {
-                    let mut links;
+                    if let Some(body) = body.ok() {
+                      let mut links;
 
-                    if res.status() == StatusCode::MOVED_PERMANENTLY {
-                      let redirection = res.headers().get("Location").unwrap().to_str().unwrap();
-                      links = vec![redirection.to_string()];
-                    } else {
                       let re = Regex::new(r#"(href|src)=["']([\w/.:\-\d,?=]+)["']"#).unwrap();
 
                       links = vec![];
                       for caps in re.captures_iter(body) {
                         links.push(caps[2].to_string());
                       }
+
+                      processing_units.fetch_sub(1, Ordering::SeqCst); // Must be before the tx send
+                      tx.send(Response {
+                        processed_link: url,
+                        extracted_links: Some(links),
+                        status: ResponseStatus::Ok,
+                      });
+                    } else {
+                      processing_units.fetch_sub(1, Ordering::SeqCst);
+                      tx.send(Response {
+                        processed_link: url,
+                        status: ResponseStatus::Err(res.status()),
+                        extracted_links: None,
+                      });
                     }
-                    processing_units.fetch_sub(1, Ordering::SeqCst); // Must be before the tx send
-                    tx.send(Response {
-                      processed_link: url,
-                      extracted_links: Some(links),
-                      status: ResponseStatus::Ok,
-                    });
-                  } else {
-                    processing_units.fetch_sub(1, Ordering::SeqCst);
-                    tx.send(Response {
-                      processed_link: url,
-                      status: ResponseStatus::Err(res.status()),
-                      extracted_links: None,
-                    });
-                  }
-                })
-                .then(|_| {
-                  future::ok(())
-                })
+                  })
+                  .then(|_| {
+                    future::ok(())
+                  })
+
+            } else if res.status().is_redirection() {
+              let redirection = res.headers().get("Location").unwrap().to_str().unwrap();
+              let links = vec![redirection.to_string()];
+              processing_units.fetch_sub(1, Ordering::SeqCst); // Must be before the tx send
+              tx.send(Response {
+                processed_link: url,
+                extracted_links: Some(links),
+                status: ResponseStatus::Ok,
+              });
+            } else {
+              processing_units.fetch_sub(1, Ordering::SeqCst); // Must be before the tx send
+              tx.send(Response {
+                processed_link: url,
+                extracted_links: None,
+                status: ResponseStatus::Err(res.status()),
+              });
+            }
           }
           Err(err) => {
             panic!("..., {:?}", err);
@@ -118,19 +132,16 @@ fn sanitize_link(scheme: &str, host: &str, link: &String) -> Result<String, Erro
 
   if is_relative {
     Ok(format!("{}://{}{}", scheme, host, link))
-  }
-  else {
+  } else {
     let parsed_url = url::Url::parse(link.as_str())?;
     let link_host = parsed_url.host_str();
 
     if let Some(l_host) = link_host {
       if l_host != host {
         Err(Error::CrossOrigin)
-      }
-      else {
+      } else {
         Ok(link.to_string())
       }
-
     } else {
       Err(Error::ParseError)
     }
